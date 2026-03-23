@@ -45,6 +45,11 @@ The goal is to provide clear, reproducible measurements of:
 h5cc -o hdf5bench hdf5bench.c
 ```
 
+On CSCS systems, first startup a prgenv-gnu uenv, e.g.
+```bash
+uenv start  prgenv-gnu/25.11:v1 --view=default
+```
+
 ## Usage
 
 ``` bash
