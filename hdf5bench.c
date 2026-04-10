@@ -7,11 +7,22 @@
 #include <string.h>
 #include <mpi.h>
 #include <hdf5.h>
+#include <math.h>
+
+extern char **environ;
 
 const float GiB = 1024*1024*1024;
+const float GB  = 1000*1000*1000;
 
+#define VERSION "1.1"
 #define FILENAME "benchmark"
 #define DATASET_NAME "field"
+
+struct stats
+{
+    double min, max;
+    double mean, std;
+};
 
 void usage(int rank) {
     if (rank == 0) {
@@ -24,19 +35,31 @@ void usage(int rank) {
         printf("  [-c chunk_elements]\n");
         printf("  [-o output_prefix]\n");
         printf("  [-i num_iterations]\n");
+        printf("  [--printenv]\n");
     }
 }
 
-int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
+void collect_stats(double v, struct stats *stats, int N)
+{
+    double sum, sq_sum;
+    double v2 = v * v;
 
-    int rank, size, rank_comm;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Reduce(&v,  &sum,       1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&v2, &sq_sum,    1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&v,  &stats->min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&v,  &stats->max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    stats->mean = sum / N;
+    stats->std  = sqrt((sq_sum / N) - stats->mean * stats->mean);
+}
+
+int main(int argc, char **argv) {
 
     char mode[16] = "shared";
+    char scaling[16] = "weak";
     size_t total_size = 0, per_rank_size = 0;
     int num_fields = 1;
+    int print_env = 0;
 
     size_t alignment = 0, threshold = 0;
     hsize_t chunk_size = 0;
@@ -59,7 +82,19 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-c") == 0) chunk_size = atoll(argv[++i]);
         else if (strcmp(argv[i], "-i") == 0) iterations = atoi(argv[++i]);
         else if (strcmp(argv[i], "-o") == 0) strncpy(output_prefix, argv[++i], sizeof(output_prefix)-1);
+        else if (strcmp(argv[i], "--printenv") == 0) print_env = 1;
     }
+
+    if (print_env)
+    {
+        setenv("MPICH_MPIIO_HINTS_DISPLAY", "1", 1);
+        setenv("MPICH_MPIIO_STATS", "1", 1);
+    }
+    MPI_Init(&argc, &argv);
+
+    int rank, size, rank_comm;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if ((total_size == 0 && per_rank_size == 0) ||
         (total_size && per_rank_size)) {
@@ -68,8 +103,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (print_env && rank == 0)
+    {
+        int found=0;
+        for (char **env = environ; *env != NULL; env++) 
+        {
+            if (strstr(*env, "MPIIO") != NULL) 
+            {
+                printf("%s\n", *env);
+                found=1;
+            }
+        }
+        if (!found)
+        {
+            printf("NO MPIIO ENVVARS FOUND\n");
+        }
+    }
+
+
     if (total_size > 0)
+    {
         per_rank_size = total_size / size;
+        strcpy(scaling, "strong");
+    }
 
     size_t elems_rank = per_rank_size / sizeof(double);
     size_t elems_field = elems_rank / num_fields;
@@ -167,63 +223,63 @@ int main(int argc, char **argv) {
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
-        double t_write_end = MPI_Wtime();
+        double t_bar_write = MPI_Wtime();
 
+        double t_flush_start = MPI_Wtime();
         H5Fflush(file, H5F_SCOPE_GLOBAL);
+        double t_flush = MPI_Wtime() - t_flush_start;
 
         MPI_Barrier(MPI_COMM_WORLD);
-        double t_flush_end = MPI_Wtime();
+        double t_bar_flush = MPI_Wtime();
 
+        double t_close_start = MPI_Wtime();
         H5Pclose(dxpl);
         H5Fclose(file);
+        double t_close = MPI_Wtime() - t_close_start;
 
         MPI_Barrier(MPI_COMM_WORLD);
-        double t_close_end = MPI_Wtime();
         double t_end = MPI_Wtime();
 
         // ---------------------------
         // REDUCTION
         // ---------------------------
-        double max_create, max_write, max_flush, max_close, max_total;
+        double t_total = t_end - t_start;
+        struct stats stats_create, stats_write, stats_flush, stats_close;
 
-        double flush_time = t_flush_end - t_write_end;
-        double close_time = t_close_end - t_flush_end;
-        double total_time = t_end - t_start;
-
-        MPI_Reduce(&t_create,   &max_create, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&t_write,    &max_write,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&flush_time, &max_flush,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&close_time, &max_close,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&total_time, &max_total,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        collect_stats(t_create, &stats_create, size);
+        collect_stats(t_write,  &stats_write, size);
+        collect_stats(t_flush,  &stats_flush, size);
+        collect_stats(t_close,  &stats_close, size);
 
         double total_bytes = (double)per_rank_size * size;
 
         if (rank == 0) {
-            printf("===== BEGIN REPORT =====\n");
+            printf("===== BEGIN REPORT v%s =====\n", VERSION);
 
-            printf("Mode: %s\nRanks: %d\nFields: %d\n", mode, size, num_fields);
-            printf("Per-rank size: %zu bytes\n", per_rank_size);
+            printf("Mode: %s\nScaling: %s\nRanks: %d\nFields: %d\n", mode, scaling, size, num_fields);
+            printf("Output prefix: %s\n", output_prefix);
+            printf("Per-rank size: %zu bytes = %.3f GB = %.3f GiB\n", per_rank_size, per_rank_size / GB, per_rank_size / GiB);
             if (alignment) printf("Alignment: %zu (threshold %zu)\n", alignment, threshold);
             if (chunk_size) printf("Chunk size: %llu elements\n", (unsigned long long)chunk_size);
 
-            printf("Iteration: %i of %i\n", iter, iterations);
             printf("Total data: %.3f GiB\n", total_bytes / GiB);
-            printf("Output prefix: %s\n", output_prefix);
+            printf("Iteration: %i of %i\n", iter, iterations);
 
-            printf("\nCreate time: %.6f s\n", max_create);
-            printf("Write time:  %.6f s\n", max_write);
-            printf("Flush time:  %.6f s\n", max_flush);
-            printf("Close time:  %.6f s\n", max_close);
-            printf("Total time:  %.6f s\n", max_total);
+            printf("\n");
+            printf("Stats (max, min, mean, std)\n");
+            printf("--------------------------------------------\n");
+            printf("Create time: %11.6f s %11.6f %11.6f %11.6f\n", stats_create.max, stats_create.min, stats_create.mean, stats_create.std);
+            printf(" Write time: %11.6f s %11.6f %11.6f %11.6f\n", stats_write.max,  stats_write.min,  stats_write.mean,  stats_write.std);
+            printf(" Flush time: %11.6f s %11.6f %11.6f %11.6f\n", stats_flush.max,  stats_flush.min,  stats_flush.mean,  stats_flush.std);
+            printf(" Close time: %11.6f s %11.6f %11.6f %11.6f\n", stats_close.max,  stats_close.min,  stats_close.mean,  stats_close.std);
+            printf(" Total time: %11.6f s\n", t_total);
 
-            printf("\nBandwidth (write only):        %.3f GiB/s\n", total_bytes / max_write / GiB);
-            printf("Bandwidth (write+flush):       %.3f GiB/s\n",
-                   total_bytes / (max_write + max_flush) / GiB);
-            printf("Bandwidth (write+flush+close): %.3f GiB/s\n",
-                   total_bytes / (max_write + max_flush + max_close) / GiB);
-            printf("Bandwidth (total):             %.3f GiB/s\n",
-                   total_bytes / max_total / GiB);
+            printf("\n");
+            printf("Bandwidth (create+write): %8.3f GiB/s\n", total_bytes / (t_bar_write - t_start) / GiB);
+            printf("Bandwidth (+flush):       %8.3f GiB/s\n", total_bytes / (t_bar_flush - t_start) / GiB);
+            printf("Bandwidth (+close):       %8.3f GiB/s\n", total_bytes / t_total / GiB);
             printf("===== END REPORT =====\n\n");
+            fflush(stdout);
         }
     }
 
